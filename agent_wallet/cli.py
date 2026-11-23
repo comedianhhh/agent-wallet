@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--confirm-above")
     s.add_argument("--expires-days", type=int)
     s.add_argument("--rate-per-min", type=int, default=60)
+    s.add_argument("--confirm-repeats", type=int, metavar="MINUTES",
+                   help="a repeat payment (same merchant and amount) within MINUTES waits for you")
     s = sub.add_parser("revoke-key"); s.add_argument("key_id", type=UUID)
     sub.add_parser("pending")
     s = sub.add_parser("confirm"); s.add_argument("payment_id", type=UUID)
@@ -93,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                     confirm_above_cents=wallet.parse_amount(a.confirm_above) if a.confirm_above else None,
                     expires_in=timedelta(days=a.expires_days) if a.expires_days else None,
                     rate_limit_per_min=a.rate_per_min,
+                    confirm_repeat_minutes=a.confirm_repeats,
                 )
                 _print({"key_id": k.key_id, "api_key": k.secret,
                         "note": "shown once; put it in the MCP host config as AGENT_WALLET_KEY"})

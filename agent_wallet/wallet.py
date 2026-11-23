@@ -119,6 +119,7 @@ def _payment_view(p: dict, replayed: bool = False) -> dict:
         "refunded_cents": p["refunded_cents"],
         "status": p["status"],
         "failure_reason": p["last_error"] if p["status"] == "failed" else "",
+        "confirm_reason": p.get("confirm_reason", ""),
         "memo": p["memo"],
         "created_at": p["created_at"].isoformat(),
         "replayed": replayed,
@@ -296,13 +297,23 @@ def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) 
 
             # Funds are held either way: a pending payment the user approves later can't bounce
             # because the agent spent the money elsewhere in the meantime.
-            needs_user = key["confirm_above_cents"] is not None and amount_cents > key["confirm_above_cents"]
-            status = "pending_confirmation" if needs_user else "processing"
+            reasons = []
+            if key["confirm_above_cents"] is not None and amount_cents > key["confirm_above_cents"]:
+                reasons.append(f"above the {fmt(key['confirm_above_cents'])} you approve yourself")
+            if key["confirm_repeat_minutes"] and conn.execute(
+                """SELECT 1 FROM payments WHERE key_id = %s AND merchant_id = %s AND amount_cents = %s
+                     AND status IN ('processing', 'settled', 'pending_confirmation')
+                     AND created_at > now() - make_interval(mins => %s) LIMIT 1""",
+                (key_id, merchant_id, amount_cents, key["confirm_repeat_minutes"]),
+            ).fetchone():
+                reasons.append(f"same merchant and amount as a payment in the last {key['confirm_repeat_minutes']} min")
+            status = "pending_confirmation" if reasons else "processing"
             p = conn.execute(
                 """INSERT INTO payments (key_id, wallet_id, merchant_id, amount_cents, memo, status,
-                                         idempotency_key, request_hash)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-                (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh),
+                                         idempotency_key, request_hash, confirm_reason)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+                (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh,
+                 "; ".join(reasons)),
             ).fetchone()
             hold = _hold_account(conn, key["user_id"])
             _post(conn, "hold", p["id"], [(key["wallet_id"], -amount_cents), (hold, amount_cents)])
@@ -436,6 +447,7 @@ def issue_key(
     confirm_above_cents: int | None = None,
     expires_in: timedelta | None = None,
     rate_limit_per_min: int = 60,
+    confirm_repeat_minutes: int | None = None,
 ) -> IssuedKey:
     if scope not in ("read", "pay"):
         raise WalletError("BAD_REQUEST", "scope must be read or pay")
@@ -446,12 +458,13 @@ def issue_key(
         w = wallet_of(conn, user_id)
         k = conn.execute(
             """INSERT INTO agent_keys (user_id, wallet_id, label, key_prefix, key_hash, scope,
-                   per_payment_cap_cents, daily_cap_cents, confirm_above_cents, expires_at, rate_limit_per_min)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                   per_payment_cap_cents, daily_cap_cents, confirm_above_cents, expires_at, rate_limit_per_min,
+                   confirm_repeat_minutes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (
                 user_id, w, label, secret[:10], hash_key(secret), scope, per_payment_cap_cents, daily_cap_cents,
                 confirm_above_cents, (datetime.now(timezone.utc) + expires_in) if expires_in else None,
-                rate_limit_per_min,
+                rate_limit_per_min, confirm_repeat_minutes,
             ),
         ).fetchone()
         for m in merchants:

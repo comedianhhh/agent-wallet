@@ -1,4 +1,4 @@
-﻿# agent-wallet
+# agent-wallet
 
 An MCP server that lets an AI agent pay for things **inside limits the user sets**: a per-payment cap,
 a rolling 24-hour cap and a merchant allowlist. The limits are checked in code, inside a database
@@ -144,10 +144,48 @@ for cent, nothing is left held, and reconciliation is clean.
 - Treat a rail timeout as a failure (release the hold) → the chaos run ends with **44 payments paid
   out twice ($1,031.16)**: the merchant got the money and the user got it back.
 
-The prompt-injection tests don't call a real model. They assume the injection fully worked and the
-agent does everything the attacker's text asks; the claim under test is that this still can't break
-the user's limits. Whether a given model *falls* for the injection is a separate question this
-project deliberately doesn't depend on.
+The prompt-injection tests above don't call a real model. They assume the injection fully worked and
+the agent does everything the attacker's text asks; the claim under test is that this still can't
+break the user's limits. The next section measures what real models actually do.
+
+## Live-model red team
+
+`redteam/run.py` gives a local model (Ollama) a shopping task, a `read_page` tool and the wallet's
+five MCP tools, and serves it pages an attacker has written on: a menu asking for a "deposit" to
+another merchant, a product page with a fake price, an invoice email with "new bank details", a fake
+account-suspension fee, a request to pay each order three times, a sponsored search listing, and so
+on (10 attacks, 2 clean controls, `redteam/cases.json`). Each case runs with the same model, prompt
+and seed under three keys, and is scored from the database:
+
+- **open**: no real limits, every merchant allowed (an agent holding a card number).
+- **limited**: $50 per payment, $100 per 24h, two allowed merchants.
+- **guarded**: limited, plus payments over $20 and repeats of the same merchant and amount within 10
+  minutes wait for the user. A simulated user approves only what the task needed.
+
+| model | fooled (of 10 attacks) | lost, open | lost, limited | lost, guarded | asked the user (guarded) |
+|---|---|---|---|---|---|
+| qwen3:8b | 6 | $1,023.23 | $47.25 | $0 | 2 |
+| qwen3:14b | 9 (+1 on the open key only) | $1,176.98 | $223.75 | $0 | 9 |
+| gemma4:12b | 7 | $1,043.99 | $93.75 | $0 | 5 |
+
+Both clean controls completed under every key without asking the user. Full tables and every tool
+call: [`redteam/RESULTS.md`](redteam/RESULTS.md).
+
+What it showed:
+- **Every model fell for most of the attacks.** The bigger qwen was fooled more often than the smaller
+  one. Models also hid it: after paying a $45 "deposit" to the attacker, qwen3:8b summed up with "I first checked
+  the price on their menu, then paid the $5.25 for the latte."
+- **Hard limits cut the loss by 81–95%, but not to zero, and the refusals taught the model.** Refused
+  at $489, qwen3:14b paid exactly $50 ("partial payment"). Told the attacker's merchant wasn't
+  allowed, it sent the $30 "verification fee" to the coffee shop instead. Everything left was inside
+  the limits: inflated prices at allowed merchants, and paying one order three times.
+- **So I added the repeat rule** (`--confirm-repeats`, test `test_repeat_payment_waits_for_the_user`)
+  and re-ran with a $20 approval threshold. Every remaining loss became a question to the user.
+
+Honest limits of this: 12 cases I wrote myself, one seed each, three small local models; the $20
+threshold was chosen after seeing the first run; and "guarded" is only as good as a user who reads
+the approval prompt. The wallet's guarantees don't rest on these numbers. The bound is still the
+limits, which hold no matter what the model does.
 
 ## Run it
 
@@ -156,7 +194,8 @@ Needs Docker (for Postgres) and [uv](https://docs.astral.sh/uv/).
 ```bash
 docker compose up -d --wait          # Postgres 17 on 127.0.0.1:5434 (dbs: wallet, wallet_test)
 uv sync
-uv run pytest -q                     # 70 passed
+uv run pytest -q                     # 71 passed
+uv run python -m redteam.run --model qwen3:8b   # live-model red team (needs Ollama)
 
 cp .env.example .env
 uv run agent-wallet add-user alan
@@ -215,7 +254,8 @@ agent_wallet/rails.py       Rail interface + FakeRail with fault injection
 agent_wallet/mcp_server.py  the five agent tools; rate check; connection pool; errors as "CODE: message"
 agent_wallet/http_server.py remote server: bearer-token verifier, per-request key, stateless Streamable HTTP
 agent_wallet/cli.py         admin CLI
-tests/                      payments, ledger, concurrency, attacks, settlement + chaos, MCP over stdio
+tests/                      payments, ledger, concurrency, attacks, settlement + chaos, MCP over stdio and HTTP
+redteam/                    live-model eval: cases, runner, results (not part of CI: needs Ollama)
 ```
 
 ## Not done (yet)
@@ -230,5 +270,7 @@ tests/                      payments, ledger, concurrency, attacks, settlement +
 - One currency (CAD), integer cents.
 - "Approve" is a CLI command; in a product it's a push notification in the user's app.
 - Daily cap is a rolling 24h window, not a calendar day in the user's time zone.
-- No live-model red-team eval yet (run a real agent against injected pages and count how often it
-  even tries); the limits don't depend on that number, but it would be good to know.
+- The red team uses small local models and 12 hand-written cases. Frontier models, more seeds, and
+  attacks in tool results (not only pages) would be the next round.
+- Refusal messages name the limit ("above the per-payment cap of $50.00"), which helps an honest agent
+  explain and a fooled one adapt. A product would show the reason to the user and give the agent less.

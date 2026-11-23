@@ -124,6 +124,26 @@ def test_small_payments_settle_large_ones_wait_for_the_user(world, confirm_key):
     assert wallet.verify_ledger(c)["ok"]
 
 
+def test_repeat_payment_waits_for_the_user(world):
+    """Found by the live-model eval: a page saying 'pay each order 3 times' was obeyed. With
+    confirm_repeat_minutes set, the second identical payment waits; a different amount doesn't."""
+    c = world["conn"]
+    k = wallet.issue_key(c, world["user"]["user_id"], label="repeats", per_payment_cap_cents=5_000,
+                         daily_cap_cents=10_000, merchants=["coffee", "books"], confirm_repeat_minutes=10).secret
+    first = wallet.pay(c, k, "coffee", 525, "latte-1", rail=RAIL)
+    assert first["status"] == "settled"
+    again = wallet.pay(c, k, "coffee", 525, "latte-2", rail=RAIL)
+    assert again["status"] == "pending_confirmation"
+    assert "same merchant and amount" in again["confirm_reason"]
+    assert wallet.pay(c, k, "coffee", 525, "latte-1", rail=RAIL)["replayed"]  # a true retry is still a replay
+    assert wallet.pay(c, k, "coffee", 395, "croissant", rail=RAIL)["status"] == "settled"
+    assert wallet.pay(c, k, "books", 525, "book", rail=RAIL)["status"] == "settled"
+    backdate(c, first["payment_id"], minutes=11)
+    wallet.decline(c, again["payment_id"])
+    assert wallet.pay(c, k, "coffee", 525, "latte-3", rail=RAIL)["status"] == "settled"
+    assert wallet.verify_ledger(c)["ok"]
+
+
 def test_pending_payments_reserve_the_daily_budget(world, confirm_key):
     c, k = world["conn"], confirm_key.secret
     wallet.pay(c, k, "coffee", 5_000, "p1", rail=RAIL)

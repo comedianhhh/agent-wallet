@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS agent_keys (
 -- Added in 0.3. ALTER ... IF NOT EXISTS so existing databases pick it up without a reset.
 ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS rate_limit_per_min int NOT NULL DEFAULT 60
     CHECK (rate_limit_per_min > 0);
+-- Added in 0.4: a second payment to the same merchant for the same amount within this many minutes
+-- waits for the user (the red-team eval showed models paying one order several times on request).
+ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS confirm_repeat_minutes int CHECK (confirm_repeat_minutes > 0);
 
 -- Calls per key per minute (fixed window). Checked before every tool call, so a looping or
 -- hijacked agent can't flood the wallet, the rail, or the decisions log.
@@ -112,6 +115,7 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS payments_by_key_time ON payments(key_id, created_at);
 CREATE INDEX IF NOT EXISTS payments_due ON payments(next_attempt_at) WHERE status = 'processing';
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirm_reason text NOT NULL DEFAULT '';
 
 -- What the last reconciliation against the rail's settlement report found. Empty run = clean.
 CREATE TABLE IF NOT EXISTS recon_issues (
