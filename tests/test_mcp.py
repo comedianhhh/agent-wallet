@@ -56,6 +56,8 @@ def test_missing_key_is_a_clear_error(world):
 def test_pending_flow_through_tools(world):
     from agent_wallet import wallet
 
+    from .conftest import RAIL
+
     c = world["conn"]
     k = wallet.issue_key(c, world["user"]["user_id"], label="ask-me", per_payment_cap_cents=5_000,
                          daily_cap_cents=10_000, merchants=["books"], confirm_above_cents=0)
@@ -66,7 +68,7 @@ def test_pending_flow_through_tools(world):
                                                "idempotency_key": "b1"})
             pid = json.loads(r.content[0].text)["payment_id"]
             assert json.loads(r.content[0].text)["status"] == "pending_confirmation"
-            wallet.confirm(c, pid)  # the user taps Approve in their app
+            wallet.confirm(c, pid, rail=RAIL)  # the user taps Approve in their app
             s = await client.call_tool("get_payment", {"payment_id": pid})
             assert json.loads(s.content[0].text)["status"] == "settled"
 

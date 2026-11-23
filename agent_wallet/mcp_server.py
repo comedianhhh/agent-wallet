@@ -39,7 +39,9 @@ Call get_wallet first to see the balance, remaining budget and allowed merchants
 Amounts are integer cents (CAD): $12.50 is 1250.
 Always pass a fresh idempotency_key per intended purchase, and reuse it only when retrying that
 same purchase (for example after a timeout): a retry with the same key never pays twice.
-A payment may come back as pending_confirmation: the user must approve it in their app; tell them so."""
+A payment may come back as pending_confirmation: the user must approve it in their app; tell them so.
+A payment may come back as processing: it was sent and the result isn't back yet. Check it with
+get_payment; never pay again for the same purchase with a new idempotency_key."""
 
 
 class Conn:
@@ -62,7 +64,7 @@ class Conn:
         raise AssertionError("unreachable")
 
 
-def build_server(conn: Conn, api_key: str | None) -> MCPServer:
+def build_server(conn: Conn, api_key: str | None, rail: Any = None) -> MCPServer:
     server = MCPServer(name="agent-wallet", instructions=INSTRUCTIONS)
 
     def call(fn: Callable[..., Any], *args: Any) -> Any:
@@ -93,8 +95,10 @@ def build_server(conn: Conn, api_key: str | None) -> MCPServer:
         merchant_id: an id from list_merchants. amount_cents: integer cents, e.g. 1250 for $12.50.
         idempotency_key: unique per purchase; reuse it only to retry the same purchase.
         memo: short note for the user's statement (max 200 chars).
-        Returns the payment with status settled or pending_confirmation (user must approve)."""
-        return call(wallet.pay, merchant_id, amount_cents, idempotency_key, memo)
+        Returns the payment. status: settled (paid), processing (sent, result not back yet: check
+        again with get_payment, do NOT pay again), pending_confirmation (user must approve),
+        failed (merchant refused; money returned to the wallet)."""
+        return call(lambda c, k: wallet.pay(c, k, merchant_id, amount_cents, idempotency_key, memo, rail=rail))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     def get_payment(payment_id: str) -> dict[str, Any]:
@@ -119,7 +123,9 @@ def main() -> None:
         init_schema(c)
         return c
 
-    build_server(Conn(factory), os.environ.get("AGENT_WALLET_KEY")).run("stdio")
+    from .rails import rail_from_env
+
+    build_server(Conn(factory), os.environ.get("AGENT_WALLET_KEY"), rail_from_env()).run("stdio")
 
 
 if __name__ == "__main__":

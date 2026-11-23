@@ -5,7 +5,7 @@ a rolling 24-hour cap and a merchant allowlist. The limits are checked in code, 
 transaction, against the ledger. Nothing the model says (and nothing a web page tells the model to say)
 can move them.
 
-Python · MCP (stdio) · Postgres · double-entry ledger · 51 tests
+Python · MCP (stdio) · Postgres · double-entry ledger · holds + payment rail + reconciliation · 63 tests
 
 ## The problem
 
@@ -35,10 +35,40 @@ This project is that idea, small enough to read in one sitting:
 4. Amount ≤ per-payment cap?
 5. Settled + still-pending payments in the last 24h + this one ≤ daily cap?
 6. Lock the wallet row; balance ≥ amount?
-7. Above the key's confirm threshold → `pending_confirmation` (holds budget, moves no money, expires in
-   15 min); otherwise post the ledger entry and settle.
+7. **Hold** the money: wallet → the user's hold account. Above the key's confirm threshold the payment
+   waits as `pending_confirmation` (money held, expires in 15 min); otherwise it goes out as `processing`.
 
-Every attempt, allowed or refused, is written to `decisions` with the reason code.
+That transaction commits before anything is sent anywhere. Every attempt, allowed or refused, is
+written to `decisions` with the reason code.
+
+## Getting the money out: the rail, and the third outcome
+
+The rail is whatever really pays the merchant (card network, gift-card issuer, bank). Calling it has
+three outcomes, not two: it paid, it refused, or **you don't know** (timeout, dropped connection, 502).
+
+```
+pay ─► hold (wallet → hold) ─► commit ─► rail.submit(idempotency_key = payment id)
+                                           ├─ succeeded ─► capture (hold → merchant)   settled
+                                           ├─ refused   ─► release (hold → wallet)     failed
+                                           └─ timeout   ─► nothing moves, retry later  processing
+```
+
+- **A timeout is never a failure.** Releasing the hold on a timeout hands the user money the merchant
+  may already have. The payment stays `processing`, still held, and is retried with backoff. The agent
+  is told so (and told not to pay again with a new key).
+- **Asking twice is always safe**: the payment id is the rail's idempotency key, so a retry gets the
+  same answer and never a second transfer.
+- **No DB lock is held while waiting on the network.** The rail is called after commit. A `processing`
+  payment is its own outbox row: the worker claims it with a lease (`next_attempt_at`), so if a process
+  dies mid-call someone else picks it up; `FOR UPDATE SKIP LOCKED` lets many workers run at once.
+- **Reconciliation** (`agent-wallet reconcile`) compares every payment with the rail's settlement
+  report. `processing` ones the rail has an answer for get finished; everything else that disagrees
+  (rail paid but we released, we settled but the rail has no record, amounts differ, unknown transfers,
+  payments stuck after 8 attempts) is written to `recon_issues` for a human.
+
+The rail here is `FakeRail`: a pretend provider with a real idempotency contract, keeping its records
+in its own schema on its own connection (so it can never share a transaction with the wallet), with
+faults injected per call: `decline`, `timeout_before` (request lost), `timeout_after` (paid, response lost).
 
 The memo is stored and shown to the user. It is never read by any rule.
 
@@ -47,11 +77,12 @@ The memo is stored and shown to the user. It is never read by any rule.
 Even if the Python had a bug, or someone ran SQL by hand:
 
 - a journal entry that doesn't sum to zero fails at commit (deferred constraint trigger);
-- a user wallet can't go below zero (deferred constraint trigger);
+- a user's wallet or hold account can't go below zero (deferred constraint trigger);
 - `postings` and `journal_entries` reject `UPDATE` and `DELETE`: corrections are new entries (refunds).
 
 `agent-wallet verify` re-audits everything from scratch: balanced entries, no negative wallets, every
-payment row matches its ledger entries and refunds, no key ever exceeded its cap in any 24h window.
+payment row matches its ledger entries (held while pending/processing, paid out only if settled) and
+refunds, no key ever exceeded its cap in any 24h window.
 
 ## Threat model and what the tests show
 
@@ -66,10 +97,23 @@ payment row matches its ledger entries and refunds, no key ever exceeded its cap
 | Parallel tool calls race past the daily cap | key row locked for the whole decision | `test_daily_cap_holds_under_a_burst`: 20 simultaneous $30 payments on a $100 cap → exactly 3 settle |
 | Two agents share one wallet and race the balance | wallet row locked + DB trigger | `test_balance_holds_when_two_keys_share_a_wallet` |
 | Buy → refund → buy again to launder budget | refunds don't give budget back; refunds are merchant-side only | `test_refund_does_not_give_the_agent_budget_back` |
+| Agent spends money the user is about to approve elsewhere | pending payments hold funds | `test_pending_payment_reserves_the_money` |
+| Rail paid, response lost | keep the hold, retry with same idempotency key | `test_response_lost_after_rail_paid`: ends settled, one transfer |
+| Process dies between commit and rail call | outbox + worker | `test_crash_between_commit_and_rail_call` |
+| Six workers on one backlog | lease + `SKIP LOCKED` + rail idempotency | `test_many_workers_at_once_pay_each_payment_once`: 40 payments, 40 transfers |
+| Provider and ledger drift apart | reconciliation | `test_reconcile_heals_processing_and_flags_real_drift` |
 
-**The lock matters.** With the `FOR UPDATE` on the key removed, the burst test lets **16 of 20**
-payments through ($480 on a $100 cap). With it, 3. (Checked by hand: edit `wallet.pay`, run
-`pytest tests/test_concurrency.py`.)
+**Chaos run** (`test_chaos_every_payment_ends_known_and_rail_matches_ledger`): 300 payments, the rail
+misbehaving on ~40% of calls (seeded). In one run: 61 responses lost after paying, 64 requests lost,
+52 declines; 90 of 300 payments first came back `processing`. After the workers finish, all 300 are
+`settled` or `failed`, the rail's successful transfers match the settled payments one for one and cent
+for cent, nothing is left held, and reconciliation is clean.
+
+**Two rules, checked by breaking them on purpose** (edit, run the tests, revert):
+- Remove the `FOR UPDATE` on the key → the burst test lets **16 of 20** payments through ($480 on a
+  $100 cap). With it, 3.
+- Treat a rail timeout as a failure (release the hold) → the chaos run ends with **44 payments paid
+  out twice ($1,031.16)**: the merchant got the money and the user got it back.
 
 The prompt-injection tests don't call a real model. They assume the injection fully worked and the
 agent does everything the attacker's text asks; the claim under test is that this still can't break
@@ -83,7 +127,7 @@ Needs Docker (for Postgres) and [uv](https://docs.astral.sh/uv/).
 ```bash
 docker compose up -d --wait          # Postgres 17 on 127.0.0.1:5434 (dbs: wallet, wallet_test)
 uv sync
-uv run pytest -q                     # 51 passed
+uv run pytest -q                     # 63 passed
 
 cp .env.example .env
 uv run agent-wallet add-user alan
@@ -96,7 +140,12 @@ uv run agent-wallet confirm <payment_id>
 uv run agent-wallet refund <payment_id> 12.50 --idempotency-key r1
 uv run agent-wallet show <user_id>                 # balance, keys, payments, refusals
 uv run agent-wallet verify                         # full ledger audit
+uv run agent-wallet worker                         # keep running: finishes in-flight payments, expires pending
+uv run agent-wallet reconcile                      # ledger vs the rail's settlement report
 ```
+
+Upgrading from 0.1: the schema changed (holds, new payment states). Reset the dev database with
+`docker compose down && docker compose up -d --wait`.
 
 ### Connect an agent (Claude Desktop / Claude Code)
 
@@ -121,16 +170,20 @@ The key goes in the host config, not the chat. The model never sees it.
 
 ```
 agent_wallet/schema.sql     tables + ledger triggers (balanced, non-negative wallet, append-only)
-agent_wallet/wallet.py      every money rule; agent side (pay, views) and admin side (fund, keys, confirm, refund)
+agent_wallet/wallet.py      every limit rule and the hold; agent side (pay, views) and admin side (fund, keys, confirm, refund)
+agent_wallet/settlement.py  claim / call the rail / capture or release; worker; reconciliation
+agent_wallet/rails.py       Rail interface + FakeRail with fault injection
 agent_wallet/mcp_server.py  the five agent tools; key from env; errors as "CODE: message"
 agent_wallet/cli.py         admin CLI
-tests/                      payments, ledger, concurrency, attacks, MCP over stdio
+tests/                      payments, ledger, concurrency, attacks, settlement + chaos, MCP over stdio
 ```
 
 ## Not done (yet)
 
-- No real payment rail: merchants are ledger accounts. Settlement to a real merchant (card network,
-  gift-card issuer, bank) would sit behind the same `pay` decision.
+- The rail is a fake. A real one (card network, gift-card issuer) plugs in behind `Rail.submit` and
+  `Rail.transfers`; its webhooks would feed the same `_apply` path the worker and reconciliation use.
+- Refunds are ledger-only (merchant → wallet). A real refund comes back through the rail as an event.
+- Schema changes are a single idempotent SQL file, not versioned migrations.
 - One currency (CAD), integer cents.
 - "Approve" is a CLI command; in a product it's a push notification in the user's app.
 - Daily cap is a rolling 24h window, not a calendar day in the user's time zone.

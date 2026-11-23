@@ -7,18 +7,20 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- Every balance lives in an account. A user's wallet, each merchant, and the outside world
--- ("funding": where top-ups come from) are all accounts, so every movement is a balanced entry.
+-- Every balance lives in an account. A user's wallet, the user's held funds (authorized, not yet
+-- paid out), each merchant, and the outside world ("funding": where top-ups come from) are all
+-- accounts, so every movement is a balanced entry.
 CREATE TABLE IF NOT EXISTS accounts (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    kind        text NOT NULL CHECK (kind IN ('wallet', 'merchant', 'funding')),
+    kind        text NOT NULL CHECK (kind IN ('wallet', 'hold', 'merchant', 'funding')),
     user_id     uuid REFERENCES users(id),
     name        text NOT NULL,
     currency    text NOT NULL DEFAULT 'CAD' CHECK (currency = 'CAD'),
     created_at  timestamptz NOT NULL DEFAULT now(),
-    CHECK ((kind = 'wallet') = (user_id IS NOT NULL))
+    CHECK ((kind IN ('wallet', 'hold')) = (user_id IS NOT NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_wallet_per_user ON accounts(user_id) WHERE kind = 'wallet';
+CREATE UNIQUE INDEX IF NOT EXISTS one_hold_per_user ON accounts(user_id) WHERE kind = 'hold';
 CREATE UNIQUE INDEX IF NOT EXISTS one_funding_account ON accounts(kind) WHERE kind = 'funding';
 
 CREATE TABLE IF NOT EXISTS merchants (
@@ -30,7 +32,8 @@ CREATE TABLE IF NOT EXISTS merchants (
 -- Double-entry ledger. One journal entry = one business event; its postings must sum to zero.
 CREATE TABLE IF NOT EXISTS journal_entries (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    kind        text NOT NULL CHECK (kind IN ('fund', 'payment', 'refund')),
+    -- payment lifecycle: hold (wallet -> hold), then capture (hold -> merchant) or release (hold -> wallet)
+    kind        text NOT NULL CHECK (kind IN ('fund', 'hold', 'capture', 'release', 'refund')),
     ref_id      uuid,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
@@ -76,16 +79,37 @@ CREATE TABLE IF NOT EXISTS payments (
     amount_cents     bigint NOT NULL CHECK (amount_cents > 0),
     refunded_cents   bigint NOT NULL DEFAULT 0,
     memo             text NOT NULL DEFAULT '',
-    status           text NOT NULL CHECK (status IN ('pending_confirmation', 'settled', 'declined', 'expired')),
+    -- pending_confirmation -> processing -> settled | failed      (funds held from the start)
+    -- pending_confirmation -> declined | expired                  (hold released)
+    status           text NOT NULL CHECK (status IN
+                         ('pending_confirmation', 'processing', 'settled', 'failed', 'declined', 'expired')),
     idempotency_key  text NOT NULL,
     request_hash     text NOT NULL,
     created_at       timestamptz NOT NULL DEFAULT now(),
     settled_at       timestamptz,
+    -- outbox: a 'processing' payment IS the job. The worker claims it by pushing next_attempt_at
+    -- forward (a lease), calls the rail with the payment id as idempotency key, then applies the result.
+    attempts         int NOT NULL DEFAULT 0,
+    next_attempt_at  timestamptz,
+    last_error       text NOT NULL DEFAULT '',
+    rail_ref         text,
     UNIQUE (key_id, idempotency_key),
     CHECK (refunded_cents BETWEEN 0 AND amount_cents),
     CHECK (refunded_cents = 0 OR status = 'settled')
 );
 CREATE INDEX IF NOT EXISTS payments_by_key_time ON payments(key_id, created_at);
+CREATE INDEX IF NOT EXISTS payments_due ON payments(next_attempt_at) WHERE status = 'processing';
+
+-- What the last reconciliation against the rail's settlement report found. Empty run = clean.
+CREATE TABLE IF NOT EXISTS recon_issues (
+    id          bigserial PRIMARY KEY,
+    run_id      uuid NOT NULL,
+    payment_id  uuid,
+    rail_key    text,
+    kind        text NOT NULL,
+    detail      text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS refunds (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -104,7 +128,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     action        text NOT NULL,
     merchant_id   text,
     amount_cents  bigint,
-    outcome       text NOT NULL CHECK (outcome IN ('settled', 'pending_confirmation', 'replayed', 'denied')),
+    outcome       text NOT NULL CHECK (outcome IN ('processing', 'pending_confirmation', 'replayed', 'denied')),
     reason        text NOT NULL DEFAULT '',
     created_at    timestamptz NOT NULL DEFAULT now()
 );
@@ -123,12 +147,12 @@ DROP TRIGGER IF EXISTS postings_balanced ON postings;
 CREATE CONSTRAINT TRIGGER postings_balanced AFTER INSERT ON postings
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION aw_check_entry_balanced();
 
--- 2. A user's wallet never goes below zero (merchants and funding may).
+-- 2. A user's wallet and held funds never go below zero (merchants and funding may).
 CREATE OR REPLACE FUNCTION aw_check_wallet_nonnegative() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    IF (SELECT kind FROM accounts WHERE id = NEW.account_id) = 'wallet'
+    IF (SELECT kind FROM accounts WHERE id = NEW.account_id) IN ('wallet', 'hold')
        AND (SELECT SUM(amount_cents) FROM postings WHERE account_id = NEW.account_id) < 0 THEN
-        RAISE EXCEPTION 'wallet % would go negative', NEW.account_id USING ERRCODE = 'check_violation';
+        RAISE EXCEPTION 'user account % would go negative', NEW.account_id USING ERRCODE = 'check_violation';
     END IF;
     RETURN NULL;
 END $$;

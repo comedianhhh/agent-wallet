@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from agent_wallet import wallet
+
+from .conftest import RAIL
 from agent_wallet.wallet import WalletError
 
 from .conftest import backdate
@@ -21,7 +23,7 @@ def codes(fn, *a, **kw) -> str:
 
 
 def test_pay_moves_money_and_balances(world):
-    p = wallet.pay(world["conn"], world["key"], "coffee", 1_250, "order-1", "latte")
+    p = wallet.pay(world["conn"], world["key"], "coffee", 1_250, "order-1", "latte", rail=RAIL)
     assert p["status"] == "settled" and p["amount"] == "$12.50"
     assert bal(world) == 50_000 - 1_250
     assert wallet.verify_ledger(world["conn"])["ok"]
@@ -47,13 +49,13 @@ def test_single_payment_rules(world, merchant, amount, code):
 
 def test_daily_cap_is_rolling_24h(world):
     c, k = world["conn"], world["key"]
-    a = wallet.pay(c, k, "coffee", 5_000, "a")
-    wallet.pay(c, k, "books", 4_000, "b")
+    a = wallet.pay(c, k, "coffee", 5_000, "a", rail=RAIL)
+    wallet.pay(c, k, "books", 4_000, "b", rail=RAIL)
     assert codes(wallet.pay, c, k, "coffee", 1_001, "c") == "OVER_DAILY_CAP"
-    wallet.pay(c, k, "coffee", 1_000, "d")  # exactly at the cap is fine
+    wallet.pay(c, k, "coffee", 1_000, "d", rail=RAIL)  # exactly at the cap is fine
     assert codes(wallet.pay, c, k, "coffee", 1, "e") == "OVER_DAILY_CAP"
     backdate(c, a["payment_id"], hours=24, seconds=1)  # the first $50 falls out of the window
-    wallet.pay(c, k, "coffee", 5_000, "f")
+    wallet.pay(c, k, "coffee", 5_000, "f", rail=RAIL)
     assert wallet.wallet_view(c, k)["remaining_last_24h_cents"] == 0
 
 
@@ -64,21 +66,21 @@ def test_insufficient_funds(conn):
     k = wallet.issue_key(conn, u["user_id"], label="a", per_payment_cap_cents=1_000, daily_cap_cents=1_000,
                          merchants=["coffee"])
     assert codes(wallet.pay, conn, k.secret, "coffee", 301, "x") == "INSUFFICIENT_FUNDS"
-    wallet.pay(conn, k.secret, "coffee", 300, "y")
+    wallet.pay(conn, k.secret, "coffee", 300, "y", rail=RAIL)
     assert wallet.balance(conn, u["wallet_id"]) == 0
 
 
 def test_retry_with_same_idempotency_key_charges_once(world):
     c, k = world["conn"], world["key"]
-    first = wallet.pay(c, k, "coffee", 1_250, "order-1", "latte")
-    again = wallet.pay(c, k, "coffee", 1_250, "order-1", "latte")
+    first = wallet.pay(c, k, "coffee", 1_250, "order-1", "latte", rail=RAIL)
+    again = wallet.pay(c, k, "coffee", 1_250, "order-1", "latte", rail=RAIL)
     assert again["payment_id"] == first["payment_id"] and again["replayed"] is True
     assert bal(world) == 50_000 - 1_250
 
 
 def test_reusing_idempotency_key_for_a_different_payment_is_refused(world):
     c, k = world["conn"], world["key"]
-    wallet.pay(c, k, "coffee", 1_250, "order-1")
+    wallet.pay(c, k, "coffee", 1_250, "order-1", rail=RAIL)
     assert codes(wallet.pay, c, k, "coffee", 4_999, "order-1") == "IDEMPOTENCY_CONFLICT"
     assert codes(wallet.pay, c, k, "books", 1_250, "order-1") == "IDEMPOTENCY_CONFLICT"
     assert bal(world) == 50_000 - 1_250
@@ -87,7 +89,7 @@ def test_reusing_idempotency_key_for_a_different_payment_is_refused(world):
 def test_denied_payment_does_not_burn_the_idempotency_key(world):
     c, k = world["conn"], world["key"]
     assert codes(wallet.pay, c, k, "coffee", 9_999, "order-1") == "OVER_PER_PAYMENT_CAP"
-    assert wallet.pay(c, k, "coffee", 999, "order-1")["status"] == "settled"
+    assert wallet.pay(c, k, "coffee", 999, "order-1", rail=RAIL)["status"] == "settled"
 
 
 def test_denials_are_logged_with_reason(world):
@@ -110,11 +112,13 @@ def confirm_key(world):
 
 def test_small_payments_settle_large_ones_wait_for_the_user(world, confirm_key):
     c = world["conn"]
-    assert wallet.pay(c, confirm_key.secret, "coffee", 2_000, "small")["status"] == "settled"
-    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "big")
+    assert wallet.pay(c, confirm_key.secret, "coffee", 2_000, "small", rail=RAIL)["status"] == "settled"
+    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "big", rail=RAIL)
     assert p["status"] == "pending_confirmation"
-    assert bal(world) == 50_000 - 2_000  # nothing moved yet
-    assert wallet.confirm(c, p["payment_id"])["status"] == "settled"
+    assert bal(world) == 50_000 - 6_000  # the $40 is held, not paid: the agent can't spend it elsewhere
+    held = wallet.wallet_view(c, confirm_key.secret)["held_cents"]
+    assert held == 4_000
+    assert wallet.confirm(c, p["payment_id"], rail=RAIL)["status"] == "settled"
     assert bal(world) == 50_000 - 6_000
     assert wallet.get_payment(c, confirm_key.secret, p["payment_id"])["status"] == "settled"
     assert wallet.verify_ledger(c)["ok"]
@@ -122,26 +126,26 @@ def test_small_payments_settle_large_ones_wait_for_the_user(world, confirm_key):
 
 def test_pending_payments_reserve_the_daily_budget(world, confirm_key):
     c, k = world["conn"], confirm_key.secret
-    wallet.pay(c, k, "coffee", 5_000, "p1")
-    wallet.pay(c, k, "coffee", 5_000, "p2")
+    wallet.pay(c, k, "coffee", 5_000, "p1", rail=RAIL)
+    wallet.pay(c, k, "coffee", 5_000, "p2", rail=RAIL)
     assert codes(wallet.pay, c, k, "coffee", 100, "p3") == "OVER_DAILY_CAP"
 
 
 def test_declined_and_expired_pending(world, confirm_key):
     c, k = world["conn"], confirm_key.secret
-    p1 = wallet.pay(c, k, "coffee", 4_000, "p1")
+    p1 = wallet.pay(c, k, "coffee", 4_000, "p1", rail=RAIL)
     wallet.decline(c, p1["payment_id"])
     assert codes(wallet.confirm, c, p1["payment_id"]) == "BAD_STATE"
-    p2 = wallet.pay(c, k, "coffee", 4_000, "p2")
+    p2 = wallet.pay(c, k, "coffee", 4_000, "p2", rail=RAIL)
     backdate(c, p2["payment_id"], minutes=16)
-    assert wallet.confirm(c, p2["payment_id"])["status"] == "expired"
+    assert wallet.confirm(c, p2["payment_id"], rail=RAIL)["status"] == "expired"
     assert bal(world) == 50_000
     assert wallet.wallet_view(c, k)["used_last_24h_cents"] == 0  # neither one holds budget any more
 
 
 def test_revoking_a_key_kills_its_pending_payments(world, confirm_key):
     c = world["conn"]
-    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "p")
+    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "p", rail=RAIL)
     wallet.revoke_key(c, confirm_key.key_id)
     assert codes(wallet.confirm, c, p["payment_id"]) == "BAD_STATE"
     assert bal(world) == 50_000
@@ -152,7 +156,7 @@ def test_revoking_a_key_kills_its_pending_payments(world, confirm_key):
 
 def test_partial_then_full_refund(world):
     c = world["conn"]
-    p = wallet.pay(c, world["key"], "books", 4_000, "book")
+    p = wallet.pay(c, world["key"], "books", 4_000, "book", rail=RAIL)
     wallet.refund(c, p["payment_id"], 1_500, "r1", "one book missing")
     assert bal(world) == 50_000 - 2_500
     assert codes(wallet.refund, c, p["payment_id"], 2_501, "r2") == "REFUND_TOO_LARGE"
@@ -164,7 +168,7 @@ def test_partial_then_full_refund(world):
 
 def test_refund_is_idempotent(world):
     c = world["conn"]
-    p = wallet.pay(c, world["key"], "books", 4_000, "book")
+    p = wallet.pay(c, world["key"], "books", 4_000, "book", rail=RAIL)
     r1 = wallet.refund(c, p["payment_id"], 1_000, "r1")
     r2 = wallet.refund(c, p["payment_id"], 1_000, "r1")
     assert r2["refund_id"] == r1["refund_id"] and r2["replayed"]
@@ -175,15 +179,15 @@ def test_refund_is_idempotent(world):
 def test_refund_does_not_give_the_agent_budget_back(world):
     """Otherwise an agent colluding with a merchant could buy, get refunded, and buy again forever."""
     c, k = world["conn"], world["key"]
-    p = wallet.pay(c, k, "books", 5_000, "a")
-    wallet.pay(c, k, "books", 5_000, "b")
+    p = wallet.pay(c, k, "books", 5_000, "a", rail=RAIL)
+    wallet.pay(c, k, "books", 5_000, "b", rail=RAIL)
     wallet.refund(c, p["payment_id"], 5_000, "r")
     assert codes(wallet.pay, c, k, "books", 100, "c") == "OVER_DAILY_CAP"
 
 
 def test_cannot_refund_unsettled_payment(world, confirm_key):
     c = world["conn"]
-    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "p")
+    p = wallet.pay(c, confirm_key.secret, "coffee", 4_000, "p", rail=RAIL)
     assert codes(wallet.refund, c, p["payment_id"], 100, "r") == "BAD_STATE"
 
 

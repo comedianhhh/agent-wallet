@@ -12,7 +12,9 @@
   agent-wallet confirm <payment_id> | decline <payment_id>
   agent-wallet refund <payment_id> 12.50 --idempotency-key r1 [--reason "damaged"]
   agent-wallet show <user_id>
-  agent-wallet verify
+  agent-wallet verify                 # ledger audit
+  agent-wallet worker [--once]        # finish in-flight payments, expire stale pending ones
+  agent-wallet reconcile              # compare the ledger with the rail's settlement report
 """
 
 from __future__ import annotations
@@ -21,11 +23,13 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import timedelta
 from uuid import UUID
 
-from . import wallet
+from . import settlement, wallet
 from .db import connect, init_schema, load_env_file
+from .rails import rail_from_env
 
 
 def _print(obj) -> None:
@@ -62,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--idempotency-key", required=True); s.add_argument("--reason", default="")
     s = sub.add_parser("show"); s.add_argument("user_id", type=UUID)
     sub.add_parser("verify")
+    s = sub.add_parser("worker"); s.add_argument("--once", action="store_true")
+    s.add_argument("--interval", type=float, default=2.0)
+    sub.add_parser("reconcile")
     a = p.parse_args(argv)
 
     conn = connect()
@@ -96,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
                     (wallet.PENDING_TTL,),
                 ).fetchall())
             case "confirm":
-                _print(wallet.confirm(conn, a.payment_id))
+                _print(wallet.confirm(conn, a.payment_id, rail=rail_from_env()))
             case "decline":
                 _print(wallet.decline(conn, a.payment_id))
             case "refund":
@@ -122,6 +129,19 @@ def main(argv: list[str] | None = None) -> int:
                 })
             case "verify":
                 r = wallet.verify_ledger(conn)
+                _print(r)
+                return 0 if r["ok"] else 1
+            case "worker":
+                rail = rail_from_env()
+                while True:
+                    r = settlement.run_worker_once(conn, rail)
+                    if a.once or r["claimed"] or r["expired"]:
+                        _print(r)
+                    if a.once:
+                        break
+                    time.sleep(a.interval)
+            case "reconcile":
+                r = settlement.reconcile(conn, rail_from_env())
                 _print(r)
                 return 0 if r["ok"] else 1
     except wallet.WalletError as e:

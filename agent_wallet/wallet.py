@@ -118,6 +118,7 @@ def _payment_view(p: dict, replayed: bool = False) -> dict:
         "amount": fmt(p["amount_cents"]),
         "refunded_cents": p["refunded_cents"],
         "status": p["status"],
+        "failure_reason": p["last_error"] if p["status"] == "failed" else "",
         "memo": p["memo"],
         "created_at": p["created_at"].isoformat(),
         "replayed": replayed,
@@ -147,13 +148,15 @@ def _now(conn: psycopg.Connection) -> datetime:
 
 
 def _spent_in_window(conn: psycopg.Connection, key_id: UUID) -> int:
-    """What this key has used of its rolling 24h budget: settled payments (refunds do NOT give the
-    budget back: a refund is the merchant's act, not the agent's) plus live pending ones, which
-    reserve their amount so a burst of pending payments can't overrun the cap."""
+    """What this key has used of its rolling 24h budget: settled and in-flight payments (refunds do
+    NOT give the budget back: a refund is the merchant's act, not the agent's) plus live pending
+    ones, which reserve their amount so a burst of pending payments can't overrun the cap. Failed,
+    declined and expired payments moved no money and use no budget."""
     row = conn.execute(
         """SELECT COALESCE(SUM(amount_cents), 0)::bigint AS s FROM payments
            WHERE key_id = %s AND created_at > now() - %s
-             AND (status = 'settled' OR (status = 'pending_confirmation' AND created_at > now() - %s))""",
+             AND (status IN ('settled', 'processing')
+                  OR (status = 'pending_confirmation' AND created_at > now() - %s))""",
         (key_id, DAY, PENDING_TTL),
     ).fetchone()
     return row["s"]
@@ -174,11 +177,42 @@ def pay(
     amount_cents: Any,
     idempotency_key: Any,
     memo: Any = "",
+    *,
+    rail: Any = None,
 ) -> dict:
-    """Pay a merchant from the key's wallet. Order of checks: key -> idempotent replay -> merchant
-    allowlist -> per-payment cap -> rolling daily cap -> balance -> (maybe) ask the user.
-    The key row is locked for the whole transaction, so two concurrent payments on one key run one
-    after the other and both see each other's spend."""
+    """Pay a merchant from the key's wallet, in two steps:
+    1. authorize (one DB transaction): every limit check, then move the money into the user's hold
+       account. Commits before anything leaves the building.
+    2. send to the rail (after commit, so a slow or dead rail never holds a DB lock), then capture
+       to the merchant or release back to the wallet. If the outcome is unknown, the payment stays
+       'processing' and the worker finishes it. With rail=None only step 1 runs."""
+    view = _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo)
+    if view["status"] == "processing" and not view["replayed"] and rail is not None:
+        from . import settlement
+
+        return settlement.attempt(conn, rail, UUID(view["payment_id"]))
+    return view
+
+
+def _hold_account(conn: psycopg.Connection, user_id: UUID) -> UUID:
+    return conn.execute("SELECT id FROM accounts WHERE kind = 'hold' AND user_id = %s", (user_id,)).fetchone()["id"]
+
+
+def _release(conn: psycopg.Connection, p: dict, status: str, reason: str = "") -> None:
+    """Give held money back to the wallet and close the payment. Caller holds the payment row lock."""
+    hold = _hold_account(conn, conn.execute("SELECT user_id FROM accounts WHERE id = %s", (p["wallet_id"],)).fetchone()["user_id"])
+    _post(conn, "release", p["id"], [(hold, -p["amount_cents"]), (p["wallet_id"], p["amount_cents"])])
+    conn.execute(
+        "UPDATE payments SET status = %s, last_error = %s, next_attempt_at = NULL WHERE id = %s",
+        (status, reason, p["id"]),
+    )
+    p["status"], p["last_error"] = status, reason
+
+
+def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) -> dict:
+    """Order of checks: key -> idempotent replay -> merchant allowlist -> per-payment cap -> rolling
+    daily cap -> balance -> (maybe) ask the user. The key row is locked for the whole transaction,
+    so two concurrent payments on one key run one after the other and both see each other's spend."""
     key_id = None
     try:
         _check_amount(amount_cents)
@@ -234,17 +268,18 @@ def pay(
             if balance(conn, key["wallet_id"]) < amount_cents:
                 raise WalletError("INSUFFICIENT_FUNDS", "the wallet balance is too low for this payment")
 
+            # Funds are held either way: a pending payment the user approves later can't bounce
+            # because the agent spent the money elsewhere in the meantime.
             needs_user = key["confirm_above_cents"] is not None and amount_cents > key["confirm_above_cents"]
-            status = "pending_confirmation" if needs_user else "settled"
+            status = "pending_confirmation" if needs_user else "processing"
             p = conn.execute(
                 """INSERT INTO payments (key_id, wallet_id, merchant_id, amount_cents, memo, status,
-                                         idempotency_key, request_hash, settled_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN NULL ELSE now() END)
-                   RETURNING *""",
-                (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh, needs_user),
+                                         idempotency_key, request_hash)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+                (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh),
             ).fetchone()
-            if not needs_user:
-                _post(conn, "payment", p["id"], [(key["wallet_id"], -amount_cents), (allowed["account_id"], amount_cents)])
+            hold = _hold_account(conn, key["user_id"])
+            _post(conn, "hold", p["id"], [(key["wallet_id"], -amount_cents), (hold, amount_cents)])
             _log(conn, key_id, "pay", merchant_id, amount_cents, status)
             return _payment_view(p)
     except WalletError as e:
@@ -284,9 +319,11 @@ def wallet_view(conn: psycopg.Connection, api_key: str) -> dict:
         key = _load_key(conn, api_key, lock=False)
         spent = _spent_in_window(conn, key["id"])
         bal = balance(conn, key["wallet_id"])
+        held = balance(conn, _hold_account(conn, key["user_id"]))
         return {
             "balance_cents": bal,
             "balance": fmt(bal),
+            "held_cents": held,
             "scope": key["scope"],
             "per_payment_cap_cents": key["per_payment_cap_cents"],
             "daily_cap_cents": key["daily_cap_cents"],
@@ -300,8 +337,10 @@ def wallet_view(conn: psycopg.Connection, api_key: str) -> dict:
 
 def _expire_if_stale(conn: psycopg.Connection, p: dict) -> None:
     if p["status"] == "pending_confirmation" and p["created_at"] <= _now(conn) - PENDING_TTL:
-        conn.execute("UPDATE payments SET status = 'expired' WHERE id = %s", (p["id"],))
-        p["status"] = "expired"
+        locked = conn.execute("SELECT * FROM payments WHERE id = %s FOR UPDATE", (p["id"],)).fetchone()
+        if locked["status"] == "pending_confirmation":
+            _release(conn, locked, "expired", "user did not approve in time")
+        p.update(locked)
 
 
 # ---------------------------------------------------------------- user / operator side (CLI only)
@@ -320,6 +359,7 @@ def create_user(conn: psycopg.Connection, name: str) -> dict:
             "INSERT INTO accounts (kind, user_id, name) VALUES ('wallet', %s, %s) RETURNING id",
             (u["id"], f"wallet:{name}"),
         ).fetchone()
+        conn.execute("INSERT INTO accounts (kind, user_id, name) VALUES ('hold', %s, %s)", (u["id"], f"hold:{name}"))
         return {"user_id": u["id"], "wallet_id": w["id"], "name": name}
 
 
@@ -400,14 +440,17 @@ def revoke_key(conn: psycopg.Connection, key_id: UUID) -> None:
         )
         if r.rowcount == 0:
             raise WalletError("NOT_FOUND", "no active key with that id")
-        # Anything still waiting for the user dies with the key.
-        conn.execute(
-            "UPDATE payments SET status = 'declined' WHERE key_id = %s AND status = 'pending_confirmation'", (key_id,)
-        )
+        # Anything still waiting for the user dies with the key. Payments already sent to the rail
+        # ('processing') were authorized while the key was valid and are left to finish.
+        for p in conn.execute(
+            "SELECT * FROM payments WHERE key_id = %s AND status = 'pending_confirmation' FOR UPDATE", (key_id,)
+        ).fetchall():
+            _release(conn, p, "declined", "key revoked")
 
 
-def confirm(conn: psycopg.Connection, payment_id: UUID) -> dict:
-    """The user approves a payment the agent asked for. Runs outside the agent's reach (CLI / app)."""
+def confirm(conn: psycopg.Connection, payment_id: UUID, *, rail: Any = None) -> dict:
+    """The user approves a payment the agent asked for. Runs outside the agent's reach (CLI / app).
+    The money is already held, so approval can't bounce; it just releases the payment to the rail."""
     with conn.transaction():
         head = conn.execute("SELECT key_id FROM payments WHERE id = %s", (payment_id,)).fetchone()
         if head is None:
@@ -417,27 +460,27 @@ def confirm(conn: psycopg.Connection, payment_id: UUID) -> dict:
         if p["status"] != "pending_confirmation":
             raise WalletError("BAD_STATE", f"payment is {p['status']}, not pending")
         if p["created_at"] <= _now(conn) - PENDING_TTL:
-            conn.execute("UPDATE payments SET status = 'expired' WHERE id = %s", (payment_id,))
+            _release(conn, p, "expired", "user did not approve in time")
             return {"payment_id": str(payment_id), "status": "expired"}
         if key["revoked_at"] is not None:
-            conn.execute("UPDATE payments SET status = 'declined' WHERE id = %s", (payment_id,))
+            _release(conn, p, "declined", "key revoked")
             return {"payment_id": str(payment_id), "status": "declined"}
-        conn.execute("SELECT id FROM accounts WHERE id = %s FOR UPDATE", (p["wallet_id"],))
-        if balance(conn, p["wallet_id"]) < p["amount_cents"]:
-            raise WalletError("INSUFFICIENT_FUNDS", "the wallet balance is too low for this payment")
-        m = conn.execute("SELECT account_id FROM merchants WHERE id = %s", (p["merchant_id"],)).fetchone()
-        _post(conn, "payment", p["id"], [(p["wallet_id"], -p["amount_cents"]), (m["account_id"], p["amount_cents"])])
-        conn.execute("UPDATE payments SET status = 'settled', settled_at = now() WHERE id = %s", (payment_id,))
-        return {"payment_id": str(payment_id), "status": "settled"}
+        conn.execute("UPDATE payments SET status = 'processing' WHERE id = %s", (payment_id,))
+    if rail is not None:
+        from . import settlement
+
+        return settlement.attempt(conn, rail, payment_id)
+    return {"payment_id": str(payment_id), "status": "processing"}
 
 
 def decline(conn: psycopg.Connection, payment_id: UUID) -> dict:
     with conn.transaction():
-        r = conn.execute(
-            "UPDATE payments SET status = 'declined' WHERE id = %s AND status = 'pending_confirmation'", (payment_id,)
-        )
-        if r.rowcount == 0:
+        p = conn.execute(
+            "SELECT * FROM payments WHERE id = %s AND status = 'pending_confirmation' FOR UPDATE", (payment_id,)
+        ).fetchone()
+        if p is None:
             raise WalletError("BAD_STATE", "no pending payment with that id")
+        _release(conn, p, "declined", "declined by user")
         return {"payment_id": str(payment_id), "status": "declined"}
 
 
@@ -484,27 +527,38 @@ def verify_ledger(conn: psycopg.Connection) -> dict:
         ).fetchall()
         negative_wallets = conn.execute(
             """SELECT a.id FROM accounts a JOIN postings p ON p.account_id = a.id
-               WHERE a.kind = 'wallet' GROUP BY a.id HAVING SUM(p.amount_cents) < 0"""
+               WHERE a.kind IN ('wallet', 'hold') GROUP BY a.id HAVING SUM(p.amount_cents) < 0"""
         ).fetchall()
         total = conn.execute("SELECT COALESCE(SUM(amount_cents), 0)::bigint AS t FROM postings").fetchone()["t"]
-        # Payments table and ledger must tell the same story, payment by payment.
+        # Payments table and ledger must tell the same story, payment by payment:
+        #   still held   = amount while pending/processing, else 0
+        #   paid out     = amount if settled, else 0
+        #   refunded     = refunds table = payments.refunded_cents
         mismatched = conn.execute(
-            """SELECT p.id FROM payments p
-               LEFT JOIN (SELECT je.ref_id, SUM(po.amount_cents) FILTER (WHERE po.amount_cents > 0) AS moved
-                          FROM journal_entries je JOIN postings po ON po.entry_id = je.id
-                          WHERE je.kind = 'payment' GROUP BY je.ref_id) l ON l.ref_id = p.id
+            """WITH moves AS (
+                   SELECT je.ref_id,
+                          SUM(po.amount_cents) FILTER (WHERE a.kind = 'hold') AS held,
+                          SUM(po.amount_cents) FILTER (WHERE je.kind = 'capture' AND a.kind = 'merchant') AS paid
+                   FROM journal_entries je
+                   JOIN postings po ON po.entry_id = je.id
+                   JOIN accounts a ON a.id = po.account_id
+                   WHERE je.kind IN ('hold', 'capture', 'release') GROUP BY je.ref_id)
+               SELECT p.id FROM payments p
+               LEFT JOIN moves m ON m.ref_id = p.id
                LEFT JOIN (SELECT payment_id, SUM(amount_cents) AS r FROM refunds GROUP BY payment_id) rf
                       ON rf.payment_id = p.id
-               WHERE COALESCE(l.moved, 0) <> CASE WHEN p.status = 'settled' THEN p.amount_cents ELSE 0 END
+               WHERE COALESCE(m.held, 0) <> CASE WHEN p.status IN ('pending_confirmation', 'processing')
+                                                 THEN p.amount_cents ELSE 0 END
+                  OR COALESCE(m.paid, 0) <> CASE WHEN p.status = 'settled' THEN p.amount_cents ELSE 0 END
                   OR COALESCE(rf.r, 0) <> p.refunded_cents"""
         ).fetchall()
         over_cap = conn.execute(
-            # No key ever had more settled payments in any 24h window than its cap.
+            # No key ever had more money out (settled or in flight) in any 24h window than its cap.
             """SELECT DISTINCT a.key_id FROM payments a
                JOIN agent_keys k ON k.id = a.key_id
-               WHERE a.status = 'settled'
+               WHERE a.status IN ('settled', 'processing')
                  AND (SELECT SUM(b.amount_cents) FROM payments b
-                      WHERE b.key_id = a.key_id AND b.status = 'settled'
+                      WHERE b.key_id = a.key_id AND b.status IN ('settled', 'processing')
                         AND b.created_at > a.created_at - interval '24 hours' AND b.created_at <= a.created_at)
                      > k.daily_cap_cents"""
         ).fetchall()

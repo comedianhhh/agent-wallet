@@ -7,6 +7,8 @@ import pytest
 
 from agent_wallet import wallet
 
+from .conftest import RAIL
+
 
 def test_unbalanced_entry_is_rejected_at_commit(world):
     c = world["conn"]
@@ -24,7 +26,7 @@ def test_wallet_cannot_go_negative_even_with_raw_sql(world):
     m = c.execute("SELECT account_id FROM merchants WHERE id = 'attacker'").fetchone()["account_id"]
     with pytest.raises(psycopg.errors.CheckViolation, match="negative"):
         with c.transaction():
-            e = c.execute("INSERT INTO journal_entries (kind) VALUES ('payment') RETURNING id").fetchone()["id"]
+            e = c.execute("INSERT INTO journal_entries (kind) VALUES ('capture') RETURNING id").fetchone()["id"]
             c.execute(
                 "INSERT INTO postings (entry_id, account_id, amount_cents) VALUES (%s, %s, -60000), (%s, %s, 60000)",
                 (e, w, e, m),
@@ -45,7 +47,7 @@ def test_ledger_is_append_only(world, sql):
 
 def test_verify_ledger_catches_a_payment_row_that_lies(world):
     c = world["conn"]
-    p = wallet.pay(c, world["key"], "coffee", 1_000, "x")
+    p = wallet.pay(c, world["key"], "coffee", 1_000, "x", rail=RAIL)
     assert wallet.verify_ledger(c)["ok"]
     c.execute("UPDATE payments SET amount_cents = 1 WHERE id = %s", (p["payment_id"],))
     r = wallet.verify_ledger(c)

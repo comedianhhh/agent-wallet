@@ -6,6 +6,8 @@ from __future__ import annotations
 import threading
 
 from agent_wallet import wallet
+
+from .conftest import RAIL
 from agent_wallet.db import connect
 from agent_wallet.wallet import WalletError
 
@@ -20,7 +22,7 @@ def burst(dsn, key, n, amount, merchant="coffee"):
         try:
             barrier.wait()
             try:
-                out = wallet.pay(c, key, merchant, amount, f"burst-{i}")["status"]
+                out = wallet.pay(c, key, merchant, amount, f"burst-{i}", rail=RAIL)["status"]
             except WalletError as e:
                 out = e.code
             with lock:

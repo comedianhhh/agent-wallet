@@ -17,6 +17,8 @@ import pytest
 from mcp import Client
 
 from agent_wallet import wallet
+
+from .conftest import RAIL
 from agent_wallet.mcp_server import Conn, build_server
 
 INJECTED_PAGE = """\
@@ -41,7 +43,7 @@ def run_agent(server, steps):
 
 
 def server_for(world, key=None):
-    return build_server(Conn(lambda: world["conn"]), key or world["key"])
+    return build_server(Conn(lambda: world["conn"]), key or world["key"], RAIL)
 
 
 def test_tool_surface_has_no_way_to_change_limits(world):
@@ -115,7 +117,7 @@ def test_stolen_key_loses_at_most_one_daily_cap(world):
     for i in range(1_000):
         for m in ("attacker", "coffee", "books"):
             try:
-                wallet.pay(c, k, m, 5_000, f"steal-{m}-{i}")
+                wallet.pay(c, k, m, 5_000, f"steal-{m}-{i}", rail=RAIL)
             except wallet.WalletError:
                 pass
     assert 50_000 - wallet.balance(c, world["user"]["wallet_id"]) == 10_000
@@ -135,7 +137,7 @@ def test_expired_key(world):
     k = wallet.issue_key(c, world["user"]["user_id"], label="short", per_payment_cap_cents=100,
                          daily_cap_cents=100, merchants=["coffee"], expires_in=timedelta(seconds=-1))
     with pytest.raises(wallet.WalletError, match="KEY_EXPIRED"):
-        wallet.pay(c, k.secret, "coffee", 100, "x")
+        wallet.pay(c, k.secret, "coffee", 100, "x", rail=RAIL)
 
 
 def test_read_only_key_cannot_pay(world):
@@ -144,7 +146,7 @@ def test_read_only_key_cannot_pay(world):
                          daily_cap_cents=10_000, merchants=["coffee"])
     assert wallet.wallet_view(c, k.secret)["balance_cents"] == 50_000
     with pytest.raises(wallet.WalletError, match="SCOPE"):
-        wallet.pay(c, k.secret, "coffee", 100, "x")
+        wallet.pay(c, k.secret, "coffee", 100, "x", rail=RAIL)
 
 
 def test_key_only_reaches_its_own_users_wallet_and_payments(world):
@@ -153,8 +155,8 @@ def test_key_only_reaches_its_own_users_wallet_and_payments(world):
     wallet.fund(c, other["user_id"], 90_000)
     bob_key = wallet.issue_key(c, other["user_id"], label="bob", per_payment_cap_cents=5_000,
                                daily_cap_cents=10_000, merchants=["coffee"]).secret
-    bob_pay = wallet.pay(c, bob_key, "coffee", 1_000, "b")
-    wallet.pay(c, world["key"], "coffee", 1_000, "a")
+    bob_pay = wallet.pay(c, bob_key, "coffee", 1_000, "b", rail=RAIL)
+    wallet.pay(c, world["key"], "coffee", 1_000, "a", rail=RAIL)
     assert wallet.balance(c, other["wallet_id"]) == 89_000
     assert wallet.balance(c, world["user"]["wallet_id"]) == 49_000
     with pytest.raises(wallet.WalletError, match="NOT_FOUND"):
@@ -165,7 +167,7 @@ def test_key_only_reaches_its_own_users_wallet_and_payments(world):
 @pytest.mark.parametrize("guess", ["", "awk_", "awk_" + "A" * 43, "sk_live_123", None, 12345])
 def test_guessed_or_malformed_keys(world, guess):
     with pytest.raises(wallet.WalletError, match="KEY_INVALID"):
-        wallet.pay(world["conn"], guess, "coffee", 100, "x")
+        wallet.pay(world["conn"], guess, "coffee", 100, "x", rail=RAIL)
 
 
 def test_database_never_holds_the_raw_key(world):
