@@ -5,7 +5,8 @@ a rolling 24-hour cap and a merchant allowlist. The limits are checked in code, 
 transaction, against the ledger. Nothing the model says (and nothing a web page tells the model to say)
 can move them.
 
-Python · MCP (stdio) · Postgres · double-entry ledger · holds + payment rail + reconciliation · 63 tests
+Python · MCP (stdio + remote Streamable HTTP) · Postgres · double-entry ledger · holds + payment rail +
+reconciliation · bearer auth + per-key rate limits · 70 tests
 
 ## The problem
 
@@ -72,6 +73,31 @@ faults injected per call: `decline`, `timeout_before` (request lost), `timeout_a
 
 The memo is stored and shown to the user. It is never read by any rule.
 
+## Remote server: one process, many agents
+
+`agent-wallet-http` serves the same five tools over MCP Streamable HTTP, for agents that don't run
+on the user's machine.
+
+- **The key is the bearer token.** Every request carries `Authorization: Bearer awk_...`. The SDK's
+  bearer middleware checks it against the database on every request; unknown, revoked or expired keys
+  get `401` before any tool runs. A revoked key stops working on the very next request.
+- **Each request acts as its own key.** Tools read the key of the current request from the auth
+  context, so one server serves many agents and none can see another's wallet. The test fires
+  interleaved concurrent requests from two agents and checks every balance that comes back.
+- **Stateless.** No MCP session is kept in server memory (`stateless_http`, JSON responses); all state,
+  rate limits included, is in Postgres, so any replica behind a load balancer can take any request.
+- **Per-key rate limit** (default 60 calls/minute, set per key with `--rate-per-min`): one atomic
+  upsert per call, counted before the tool does anything. A looping or hijacked agent can't flood the
+  wallet, the rail or the decisions log; other keys are unaffected.
+- **Connection pool.** The SDK runs sync tools in worker threads, so parallel tool calls really run
+  in parallel. Each borrows its own pooled connection. Version 0.2 shared one connection across those
+  threads; reproduced by hand, 20 parallel `pay` calls on it all failed and left the connection stuck
+  inside an open transaction (money safe, wallet frozen). Fixed in 0.3, with a test that 20 parallel
+  calls on the pool settle exactly 3 against a $100 cap.
+
+The keys are issued by the wallet (`agent-wallet issue-key`), so the server is an OAuth *resource
+server* accepting pre-issued tokens; it doesn't run an OAuth authorization flow.
+
 ## What the database enforces on its own
 
 Even if the Python had a bug, or someone ran SQL by hand:
@@ -102,6 +128,9 @@ refunds, no key ever exceeded its cap in any 24h window.
 | Process dies between commit and rail call | outbox + worker | `test_crash_between_commit_and_rail_call` |
 | Six workers on one backlog | lease + `SKIP LOCKED` + rail idempotency | `test_many_workers_at_once_pay_each_payment_once`: 40 payments, 40 transfers |
 | Provider and ledger drift apart | reconciliation | `test_reconcile_heals_processing_and_flags_real_drift` |
+| No / fake / revoked bearer token on the remote server | verified per request, 401 before any tool | `test_requests_without_a_valid_key_are_refused_before_any_tool`, `test_revoked_key_is_refused_on_the_next_request` |
+| One agent's request served with another's identity | key read from the request's auth context | `test_one_server_many_agents_each_sees_only_its_own_wallet` |
+| Agent stuck in a loop hammering the wallet | per-key rate limit in Postgres | `test_rate_limit_is_per_key`, `test_rate_limit_stops_a_looping_agent_before_it_floods_the_log` |
 
 **Chaos run** (`test_chaos_every_payment_ends_known_and_rail_matches_ledger`): 300 payments, the rail
 misbehaving on ~40% of calls (seeded). In one run: 61 responses lost after paying, 64 requests lost,
@@ -127,7 +156,7 @@ Needs Docker (for Postgres) and [uv](https://docs.astral.sh/uv/).
 ```bash
 docker compose up -d --wait          # Postgres 17 on 127.0.0.1:5434 (dbs: wallet, wallet_test)
 uv sync
-uv run pytest -q                     # 63 passed
+uv run pytest -q                     # 70 passed
 
 cp .env.example .env
 uv run agent-wallet add-user alan
@@ -166,6 +195,16 @@ Upgrading from 0.1: the schema changed (holds, new payment states). Reset the de
 
 The key goes in the host config, not the chat. The model never sees it.
 
+### Remote (Streamable HTTP)
+
+```bash
+AGENT_WALLET_HTTP_HOST=127.0.0.1 AGENT_WALLET_HTTP_PORT=8765 uv run agent-wallet-http
+```
+
+Point an MCP client at `http://127.0.0.1:8765/mcp` with the header `Authorization: Bearer awk_...`.
+Put TLS in front of it (a reverse proxy) before it leaves localhost; set `AGENT_WALLET_PUBLIC_URL` to
+the public address.
+
 ## Layout
 
 ```
@@ -173,7 +212,8 @@ agent_wallet/schema.sql     tables + ledger triggers (balanced, non-negative wal
 agent_wallet/wallet.py      every limit rule and the hold; agent side (pay, views) and admin side (fund, keys, confirm, refund)
 agent_wallet/settlement.py  claim / call the rail / capture or release; worker; reconciliation
 agent_wallet/rails.py       Rail interface + FakeRail with fault injection
-agent_wallet/mcp_server.py  the five agent tools; key from env; errors as "CODE: message"
+agent_wallet/mcp_server.py  the five agent tools; rate check; connection pool; errors as "CODE: message"
+agent_wallet/http_server.py remote server: bearer-token verifier, per-request key, stateless Streamable HTTP
 agent_wallet/cli.py         admin CLI
 tests/                      payments, ledger, concurrency, attacks, settlement + chaos, MCP over stdio
 ```
@@ -183,7 +223,10 @@ tests/                      payments, ledger, concurrency, attacks, settlement +
 - The rail is a fake. A real one (card network, gift-card issuer) plugs in behind `Rail.submit` and
   `Rail.transfers`; its webhooks would feed the same `_apply` path the worker and reconciliation use.
 - Refunds are ledger-only (merchant → wallet). A real refund comes back through the rail as an event.
-- Schema changes are a single idempotent SQL file, not versioned migrations.
+- Schema changes are a single idempotent SQL file (new columns via `ALTER … IF NOT EXISTS`), not
+  versioned migrations.
+- No OAuth authorization flow for the remote server: keys are issued by the admin CLI and sent as
+  bearer tokens. No TLS in the app itself (terminate it at a proxy).
 - One currency (CAD), integer cents.
 - "Approve" is a CLI command; in a product it's a push notification in the user's app.
 - Daily cap is a rolling 24h window, not a calendar day in the user's time zone.

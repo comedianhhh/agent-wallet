@@ -1,8 +1,11 @@
 """The agent's side of the wallet, as an MCP server.
 
 Design:
-- The API key comes from the environment (AGENT_WALLET_KEY), which the MCP host sets when it starts
-  this process. The model never sees the key and no tool takes one, so a prompt can't switch keys.
+- The API key comes from outside the conversation: the environment (AGENT_WALLET_KEY) when the MCP
+  host starts this process over stdio, or the HTTP Authorization header when it runs as a remote
+  server (http_server.py). The model never sees the key and no tool takes one, so a prompt can't
+  switch keys.
+- Every tool call counts against the key's per-minute rate limit first.
 - Five tools, and none of them can change a limit, the allowlist, or issue a refund. Those live in
   the admin CLI, which this module does not import. What the agent cannot call it cannot misuse.
 - Every refusal comes back as a ToolError with a stable code ("OVER_DAILY_CAP: ...") so the agent
@@ -17,16 +20,19 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from collections.abc import Callable
 from typing import Any
 
 import psycopg
 from mcp.server import MCPServer
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import wallet
-from .db import connect, init_schema, load_env_file
+from .db import connect, dsn, init_schema, load_env_file
 
 log = logging.getLogger("agent_wallet.mcp")
 
@@ -45,33 +51,65 @@ get_payment; never pay again for the same purchase with a new idempotency_key.""
 
 
 class Conn:
-    """One lazily opened connection, reopened once if it dropped."""
+    """One connection, used by one tool call at a time. The SDK runs sync tools in worker threads,
+    so without the lock two concurrent tool calls would interleave their transactions on the same
+    connection. Fine for tests and a single local agent; servers use PoolConn."""
 
     def __init__(self, factory: Callable[[], psycopg.Connection]):
         self._factory = factory
         self._conn: psycopg.Connection | None = None
+        self._lock = threading.Lock()
 
     def run(self, fn: Callable[[psycopg.Connection], Any]) -> Any:
-        for attempt in (1, 2):
-            if self._conn is None or self._conn.closed:
-                self._conn = self._factory()
-            try:
-                return fn(self._conn)
-            except psycopg.OperationalError:
-                self._conn = None
-                if attempt == 2:
-                    raise
-        raise AssertionError("unreachable")
+        with self._lock:
+            for attempt in (1, 2):
+                if self._conn is None or self._conn.closed:
+                    self._conn = self._factory()
+                try:
+                    return fn(self._conn)
+                except psycopg.OperationalError:
+                    self._conn = None
+                    if attempt == 2:
+                        raise
+            raise AssertionError("unreachable")
 
 
-def build_server(conn: Conn, api_key: str | None, rail: Any = None) -> MCPServer:
-    server = MCPServer(name="agent-wallet", instructions=INSTRUCTIONS)
+class PoolConn:
+    """Each tool call borrows its own connection from a pool, so calls run in parallel."""
+
+    def __init__(self, url: str, max_size: int = 10):
+        def configure(c: psycopg.Connection) -> None:
+            c.autocommit = True
+            c.row_factory = dict_row
+
+        self.pool = ConnectionPool(url, min_size=1, max_size=max_size, configure=configure, open=True,
+                                   check=ConnectionPool.check_connection)
+
+    def run(self, fn: Callable[[psycopg.Connection], Any]) -> Any:
+        with self.pool.connection() as c:
+            return fn(c)
+
+
+KeySource = str | None | Callable[[], str | None]
+
+
+def build_server(conn: Conn | PoolConn, api_key: KeySource, rail: Any = None, **server_kwargs: Any) -> MCPServer:
+    """api_key: a fixed key (stdio: from the env), or a function returning the current request's
+    key (HTTP: the verified bearer token). Every tool call is counted against the key's rate limit
+    before it does anything else."""
+    server = MCPServer(name="agent-wallet", instructions=INSTRUCTIONS, **server_kwargs)
 
     def call(fn: Callable[..., Any], *args: Any) -> Any:
-        if not api_key:
-            raise ToolError("NOT_CONFIGURED: AGENT_WALLET_KEY is not set for this MCP server")
+        key = api_key() if callable(api_key) else api_key
+        if not key:
+            raise ToolError("NOT_CONFIGURED: no API key (set AGENT_WALLET_KEY, or send a bearer token)")
+
+        def run(c: psycopg.Connection) -> Any:
+            wallet.check_rate(c, key)
+            return fn(c, key, *args)
+
         try:
-            return conn.run(lambda c: fn(c, api_key, *args))
+            return conn.run(run)
         except wallet.WalletError as e:
             raise ToolError(f"{e.code}: {e.message}") from e
         except psycopg.OperationalError as e:
@@ -118,14 +156,11 @@ def main() -> None:
     if os.environ.get("AGENT_WALLET_ENV_FILE"):
         load_env_file(os.environ["AGENT_WALLET_ENV_FILE"])
 
-    def factory() -> psycopg.Connection:
-        c = connect()
+    with connect() as c:
         init_schema(c)
-        return c
-
     from .rails import rail_from_env
 
-    build_server(Conn(factory), os.environ.get("AGENT_WALLET_KEY"), rail_from_env()).run("stdio")
+    build_server(PoolConn(dsn(), max_size=4), os.environ.get("AGENT_WALLET_KEY"), rail_from_env()).run("stdio")
 
 
 if __name__ == "__main__":

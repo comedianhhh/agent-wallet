@@ -147,6 +147,32 @@ def _now(conn: psycopg.Connection) -> datetime:
     return conn.execute("SELECT now() AS t").fetchone()["t"]
 
 
+def authenticate(conn: psycopg.Connection, api_key: Any) -> dict:
+    """Who is this key? For the HTTP server's bearer-token check. Raises WalletError if invalid."""
+    with conn.transaction():
+        k = _load_key(conn, api_key, lock=False)
+        return {"key_id": k["id"], "user_id": k["user_id"], "scope": k["scope"], "expires_at": k["expires_at"]}
+
+
+def check_rate(conn: psycopg.Connection, api_key: Any) -> None:
+    """Count this call against the key's per-minute budget; refuse past it. One atomic upsert,
+    so it holds across processes and servers sharing the database."""
+    with conn.transaction():
+        k = _load_key(conn, api_key, lock=False)
+        row = conn.execute(
+            """INSERT INTO rate_windows (key_id, window_start, count)
+               VALUES (%s, date_trunc('minute', now()), 1)
+               ON CONFLICT (key_id, window_start) DO UPDATE SET count = rate_windows.count + 1
+               RETURNING count, 60 - EXTRACT(second FROM now())::int AS retry_after""",
+            (k["id"],),
+        ).fetchone()
+    if row["count"] > k["rate_limit_per_min"]:
+        raise WalletError(
+            "RATE_LIMITED",
+            f"more than {k['rate_limit_per_min']} calls this minute; retry in {max(1, row['retry_after'])}s",
+        )
+
+
 def _spent_in_window(conn: psycopg.Connection, key_id: UUID) -> int:
     """What this key has used of its rolling 24h budget: settled and in-flight payments (refunds do
     NOT give the budget back: a refund is the merchant's act, not the agent's) plus live pending
@@ -409,6 +435,7 @@ def issue_key(
     merchants: list[str],
     confirm_above_cents: int | None = None,
     expires_in: timedelta | None = None,
+    rate_limit_per_min: int = 60,
 ) -> IssuedKey:
     if scope not in ("read", "pay"):
         raise WalletError("BAD_REQUEST", "scope must be read or pay")
@@ -419,11 +446,12 @@ def issue_key(
         w = wallet_of(conn, user_id)
         k = conn.execute(
             """INSERT INTO agent_keys (user_id, wallet_id, label, key_prefix, key_hash, scope,
-                   per_payment_cap_cents, daily_cap_cents, confirm_above_cents, expires_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                   per_payment_cap_cents, daily_cap_cents, confirm_above_cents, expires_at, rate_limit_per_min)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (
                 user_id, w, label, secret[:10], hash_key(secret), scope, per_payment_cap_cents, daily_cap_cents,
                 confirm_above_cents, (datetime.now(timezone.utc) + expires_in) if expires_in else None,
+                rate_limit_per_min,
             ),
         ).fetchone()
         for m in merchants:

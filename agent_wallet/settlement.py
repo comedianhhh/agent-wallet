@@ -106,6 +106,7 @@ def run_worker_once(conn: psycopg.Connection, rail: Rail, batch: int = 50) -> di
         ).fetchall():
             _release(conn, p, "expired", "user did not approve in time")
             expired += 1
+        conn.execute("DELETE FROM rate_windows WHERE window_start < now() - interval '1 hour'")
 
     claimed = conn.execute(
         """UPDATE payments SET attempts = attempts + 1, next_attempt_at = now() + %s

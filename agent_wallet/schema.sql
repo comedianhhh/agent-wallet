@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS agent_keys (
     created_at             timestamptz NOT NULL DEFAULT now()
 );
 
+-- Added in 0.3. ALTER ... IF NOT EXISTS so existing databases pick it up without a reset.
+ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS rate_limit_per_min int NOT NULL DEFAULT 60
+    CHECK (rate_limit_per_min > 0);
+
+-- Calls per key per minute (fixed window). Checked before every tool call, so a looping or
+-- hijacked agent can't flood the wallet, the rail, or the decisions log.
+CREATE TABLE IF NOT EXISTS rate_windows (
+    key_id        uuid NOT NULL REFERENCES agent_keys(id),
+    window_start  timestamptz NOT NULL,
+    count         int NOT NULL,
+    PRIMARY KEY (key_id, window_start)
+);
+
 CREATE TABLE IF NOT EXISTS key_merchants (
     key_id       uuid NOT NULL REFERENCES agent_keys(id),
     merchant_id  text NOT NULL REFERENCES merchants(id),
