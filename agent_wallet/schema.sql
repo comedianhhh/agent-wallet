@@ -71,6 +71,9 @@ ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS rate_limit_per_min int NOT NULL 
 -- Added in 0.4: a second payment to the same merchant for the same amount within this many minutes
 -- waits for the user (the red-team eval showed models paying one order several times on request).
 ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS confirm_repeat_minutes int CHECK (confirm_repeat_minutes > 0);
+-- Added in 0.5: a key that may only pay merchant-signed carts (the amount comes from the merchant's
+-- signature, never from the agent).
+ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS require_signed_cart boolean NOT NULL DEFAULT false;
 
 -- Calls per key per minute (fixed window). Checked before every tool call, so a looping or
 -- hijacked agent can't flood the wallet, the rail, or the decisions log.
@@ -116,6 +119,22 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS payments_by_key_time ON payments(key_id, created_at);
 CREATE INDEX IF NOT EXISTS payments_due ON payments(next_attempt_at) WHERE status = 'processing';
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirm_reason text NOT NULL DEFAULT '';
+-- Signed carts (0.5). One live payment per merchant cart: paying the same cart twice is refused even
+-- with a new idempotency key or from another key. A cart whose payment failed can be paid again.
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS public_key bytea CHECK (length(public_key) = 32);
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS cart_id text;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS cart jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS payments_one_live_per_cart ON payments (merchant_id, cart_id)
+    WHERE cart_id IS NOT NULL AND status NOT IN ('failed', 'declined', 'expired');
+-- Carts a merchant's checkout handed to the wallet directly, so the agent only carries a short
+-- reference ("coffee/cart-1a2b"). Models copying a long signed token corrupt it.
+CREATE TABLE IF NOT EXISTS merchant_carts (
+    merchant_id  text NOT NULL REFERENCES merchants(id),
+    cart_id      text NOT NULL,
+    token        text NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (merchant_id, cart_id)
+);
 
 -- What the last reconciliation against the rail's settlement report found. Empty run = clean.
 CREATE TABLE IF NOT EXISTS recon_issues (

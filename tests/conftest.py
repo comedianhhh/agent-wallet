@@ -14,7 +14,7 @@ from agent_wallet.rails import FakeRail
 
 TEST_DSN = os.environ.get("AGENT_WALLET_TEST_DSN", "postgresql://wallet:wallet@127.0.0.1:5434/wallet_test")
 TABLES = (
-    "rate_windows, recon_issues, decisions, refunds, payments, key_merchants, agent_keys, postings, journal_entries,"
+    "merchant_carts, rate_windows, recon_issues, decisions, refunds, payments, key_merchants, agent_keys, postings, journal_entries,"
     " merchants, accounts, users, fake_rail.transfers"
 )
 RAIL = FakeRail(TEST_DSN)  # always succeeds; tests that need faults build their own

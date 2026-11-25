@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -47,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("init-db")
     s = sub.add_parser("add-user"); s.add_argument("name")
     s = sub.add_parser("add-merchant"); s.add_argument("merchant_id"); s.add_argument("name")
+    s.add_argument("--public-key", help="base64 Ed25519 public key for merchant-signed carts")
+    sub.add_parser("merchant-keygen", help="new Ed25519 key pair for a merchant checkout (private key stays there)")
     s = sub.add_parser("fund"); s.add_argument("user_id", type=UUID); s.add_argument("amount")
     s = sub.add_parser("issue-key")
     s.add_argument("user_id", type=UUID)
@@ -60,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--rate-per-min", type=int, default=60)
     s.add_argument("--confirm-repeats", type=int, metavar="MINUTES",
                    help="a repeat payment (same merchant and amount) within MINUTES waits for you")
+    s.add_argument("--signed-carts-only", action="store_true",
+                   help="this key may only pay merchant-signed carts (pay_cart)")
     s = sub.add_parser("revoke-key"); s.add_argument("key_id", type=UUID)
     sub.add_parser("pending")
     s = sub.add_parser("confirm"); s.add_argument("payment_id", type=UUID)
@@ -83,7 +88,14 @@ def main(argv: list[str] | None = None) -> int:
             case "add-user":
                 _print(wallet.create_user(conn, a.name))
             case "add-merchant":
-                _print(wallet.create_merchant(conn, a.merchant_id, a.name))
+                pk = base64.b64decode(a.public_key) if a.public_key else None
+                _print(wallet.create_merchant(conn, a.merchant_id, a.name, public_key=pk))
+            case "merchant-keygen":
+                from .carts import new_merchant_key
+
+                sk, pk = new_merchant_key()
+                _print({"private_key": base64.b64encode(sk).decode(), "public_key": base64.b64encode(pk).decode(),
+                        "note": "give the private key to the merchant checkout only; register the public key"})
             case "fund":
                 _print({"balance": wallet.fmt(wallet.fund(conn, a.user_id, wallet.parse_amount(a.amount)))})
             case "issue-key":
@@ -96,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
                     expires_in=timedelta(days=a.expires_days) if a.expires_days else None,
                     rate_limit_per_min=a.rate_per_min,
                     confirm_repeat_minutes=a.confirm_repeats,
+                    require_signed_cart=a.signed_carts_only,
                 )
                 _print({"key_id": k.key_id, "api_key": k.secret,
                         "note": "shown once; put it in the MCP host config as AGENT_WALLET_KEY"})

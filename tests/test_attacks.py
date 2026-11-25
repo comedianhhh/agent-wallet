@@ -47,15 +47,15 @@ def server_for(world, key=None):
 
 
 def test_tool_surface_has_no_way_to_change_limits(world):
-    """The agent's whole world is these five tools. None takes a key, a limit or an allowlist."""
+    """The agent's whole world is these six tools. None takes a key, a limit or an allowlist."""
     async def go():
         async with Client(server_for(world)) as client:
             return (await client.list_tools()).tools
 
     tools = anyio.run(go)
-    assert {t.name for t in tools} == {"get_wallet", "list_merchants", "pay", "get_payment", "list_payments"}
+    assert {t.name for t in tools} == {"get_wallet", "list_merchants", "pay", "pay_cart", "get_payment", "list_payments"}
     params = {p for t in tools for p in (t.input_schema.get("properties") or {})}
-    assert params == {"merchant_id", "amount_cents", "idempotency_key", "memo", "payment_id", "limit"}
+    assert params == {"merchant_id", "amount_cents", "idempotency_key", "memo", "cart", "payment_id", "limit"}
 
 
 def test_hijacked_agent_follows_injected_instructions(world):

@@ -6,7 +6,7 @@ Design:
   server (http_server.py). The model never sees the key and no tool takes one, so a prompt can't
   switch keys.
 - Every tool call counts against the key's per-minute rate limit first.
-- Five tools, and none of them can change a limit, the allowlist, or issue a refund. Those live in
+- Six tools, and none of them can change a limit, the allowlist, or issue a refund. Those live in
   the admin CLI, which this module does not import. What the agent cannot call it cannot misuse.
 - Every refusal comes back as a ToolError with a stable code ("OVER_DAILY_CAP: ...") so the agent
   can explain it to the user instead of retrying blindly.
@@ -47,7 +47,9 @@ Always pass a fresh idempotency_key per intended purchase, and reuse it only whe
 same purchase (for example after a timeout): a retry with the same key never pays twice.
 A payment may come back as pending_confirmation: the user must approve it in their app; tell them so.
 A payment may come back as processing: it was sent and the result isn't back yet. Check it with
-get_payment; never pay again for the same purchase with a new idempotency_key."""
+get_payment; never pay again for the same purchase with a new idempotency_key.
+If the merchant's checkout gives you a signed cart, pay it with pay_cart: the amount is the
+merchant's signed total and can't be changed. Some keys only accept signed carts."""
 
 
 class Conn:
@@ -137,6 +139,15 @@ def build_server(conn: Conn | PoolConn, api_key: KeySource, rail: Any = None, **
         again with get_payment, do NOT pay again), pending_confirmation (user must approve),
         failed (merchant refused; money returned to the wallet)."""
         return call(lambda c, k: wallet.pay(c, k, merchant_id, amount_cents, idempotency_key, memo, rail=rail))
+
+    @server.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True)
+    )
+    def pay_cart(cart: str, idempotency_key: str, memo: str = "") -> dict[str, Any]:
+        """Pay a cart signed by the merchant's checkout. cart: the cart reference the checkout gave
+        you (like "coffee/cart-1a2b"), or the full signed token. The merchant and amount are the cart's signed contents; you can't change
+        them, and each cart can be paid once. Same limits, statuses and idempotency rules as pay."""
+        return call(lambda c, k: wallet.pay_cart(c, k, cart, idempotency_key, memo, rail=rail))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     def get_payment(payment_id: str) -> dict[str, Any]:

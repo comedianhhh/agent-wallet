@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 KEY_PREFIX = "awk_"
 MAX_AMOUNT_CENTS = 100_000_000  # $1M: anything above is a bug, not a payment
@@ -120,6 +121,7 @@ def _payment_view(p: dict, replayed: bool = False) -> dict:
         "status": p["status"],
         "failure_reason": p["last_error"] if p["status"] == "failed" else "",
         "confirm_reason": p.get("confirm_reason", ""),
+        "cart_items": (p.get("cart") or {}).get("items", []),
         "memo": p["memo"],
         "created_at": p["created_at"].isoformat(),
         "replayed": replayed,
@@ -213,12 +215,74 @@ def pay(
     2. send to the rail (after commit, so a slow or dead rail never holds a DB lock), then capture
        to the merchant or release back to the wallet. If the outcome is unknown, the payment stays
        'processing' and the worker finishes it. With rail=None only step 1 runs."""
-    view = _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo)
+    return _send(conn, rail, _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo))
+
+
+def pay_cart(
+    conn: psycopg.Connection, api_key: str, cart: Any, idempotency_key: Any, memo: Any = "", *, rail: Any = None
+) -> dict:
+    """Pay a merchant-signed cart. Merchant and amount come from the cart, and only count once the
+    signature checks out against the merchant's registered key. Same limits, hold and rail as pay()."""
+    from . import carts
+
+    if isinstance(cart, str) and "." not in cart and cart.count("/") == 1 and len(cart) <= 260:
+        mid, cid = cart.split("/")
+        row = conn.execute("SELECT token FROM merchant_carts WHERE merchant_id = %s AND cart_id = %s",
+                           (mid, cid)).fetchone()
+        if row is None:
+            raise WalletError("CART_NOT_FOUND", f"no cart {cart!r}; check out again")
+        cart = row["token"]
+    try:
+        head = carts.peek(cart)
+    except carts.CartError as e:
+        raise WalletError(e.code, e.message) from None
+    return _send(conn, rail, _authorize(conn, api_key, head["merchant_id"], head["total_cents"], idempotency_key,
+                                        memo, cart_token=cart, cart=head))
+
+
+def submit_cart(conn: psycopg.Connection, token: str) -> str:
+    """Merchant side (not an agent tool): the checkout hands its signed cart to the wallet and gives
+    the agent the returned reference. Verified here and again when paid."""
+    from . import carts
+
+    try:
+        head = carts.peek(token)
+        m = conn.execute("SELECT public_key FROM merchants WHERE id = %s", (head["merchant_id"],)).fetchone()
+        if m is None or m["public_key"] is None:
+            raise carts.CartError("CART_SIGNATURE_INVALID", "merchant has no registered signing key")
+        carts.verify(token, bytes(m["public_key"]), _now(conn))
+    except carts.CartError as e:
+        raise WalletError(e.code, e.message) from None
+    conn.execute("INSERT INTO merchant_carts (merchant_id, cart_id, token) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                 (head["merchant_id"], head["cart_id"], token))
+    return f"{head['merchant_id']}/{head['cart_id']}"
+
+
+def _send(conn: psycopg.Connection, rail: Any, view: dict) -> dict:
     if view["status"] == "processing" and not view["replayed"] and rail is not None:
         from . import settlement
 
         return settlement.attempt(conn, rail, UUID(view["payment_id"]))
     return view
+
+
+def _verify_cart(conn: psycopg.Connection, merchant_id: str, token: str, cart: dict) -> None:
+    """Signature against the merchant's registered key, expiry against the DB clock, and one live
+    payment per cart (the unique index backs this up across keys and races)."""
+    from . import carts
+
+    m = conn.execute("SELECT public_key FROM merchants WHERE id = %s", (merchant_id,)).fetchone()
+    if m["public_key"] is None:
+        raise WalletError("CART_SIGNATURE_INVALID", f"merchant {merchant_id!r} has no registered signing key")
+    try:
+        carts.verify(token, bytes(m["public_key"]), _now(conn))
+    except carts.CartError as e:
+        raise WalletError(e.code, e.message) from None
+    if conn.execute(
+        "SELECT 1 FROM payments WHERE merchant_id = %s AND cart_id = %s AND status NOT IN ('failed', 'declined', 'expired')",
+        (merchant_id, cart["cart_id"]),
+    ).fetchone():
+        raise WalletError("CART_ALREADY_PAID", "this cart has already been paid")
 
 
 def _hold_account(conn: psycopg.Connection, user_id: UUID) -> UUID:
@@ -236,7 +300,7 @@ def _release(conn: psycopg.Connection, p: dict, status: str, reason: str = "") -
     p["status"], p["last_error"] = status, reason
 
 
-def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) -> dict:
+def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo, cart_token=None, cart=None) -> dict:
     """Order of checks: key -> idempotent replay -> merchant allowlist -> per-payment cap -> rolling
     daily cap -> balance -> (maybe) ask the user. The key row is locked for the whole transaction,
     so two concurrent payments on one key run one after the other and both see each other's spend."""
@@ -254,8 +318,13 @@ def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) 
             key_id = key["id"]
             if key["scope"] != "pay":
                 raise WalletError("SCOPE", "this API key is read-only")
+            if key["require_signed_cart"] and cart is None:
+                raise WalletError(
+                    "SIGNED_CART_REQUIRED",
+                    "this key only pays merchant-signed carts: get one from the merchant's checkout and use pay_cart",
+                )
 
-            rh = _request_hash(merchant_id, amount_cents, memo)
+            rh = _request_hash(merchant_id, amount_cents, memo + ("\x1fcart:" + cart["cart_id"] if cart else ""))
             prior = conn.execute(
                 "SELECT * FROM payments WHERE key_id = %s AND idempotency_key = %s", (key_id, idempotency_key)
             ).fetchone()
@@ -277,6 +346,8 @@ def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) 
             ).fetchone()
             if allowed is None:
                 raise WalletError("MERCHANT_NOT_ALLOWED", f"merchant {merchant_id!r} is not on this key's allowlist")
+            if cart is not None:
+                _verify_cart(conn, merchant_id, cart_token, cart)
 
             if amount_cents > key["per_payment_cap_cents"]:
                 raise WalletError(
@@ -308,13 +379,19 @@ def _authorize(conn, api_key, merchant_id, amount_cents, idempotency_key, memo) 
             ).fetchone():
                 reasons.append(f"same merchant and amount as a payment in the last {key['confirm_repeat_minutes']} min")
             status = "pending_confirmation" if reasons else "processing"
-            p = conn.execute(
-                """INSERT INTO payments (key_id, wallet_id, merchant_id, amount_cents, memo, status,
-                                         idempotency_key, request_hash, confirm_reason)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-                (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh,
-                 "; ".join(reasons)),
-            ).fetchone()
+            try:
+                p = conn.execute(
+                    """INSERT INTO payments (key_id, wallet_id, merchant_id, amount_cents, memo, status,
+                                             idempotency_key, request_hash, confirm_reason, cart_id, cart)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+                    (key_id, key["wallet_id"], merchant_id, amount_cents, memo, status, idempotency_key, rh,
+                     "; ".join(reasons), cart["cart_id"] if cart else None, Jsonb(cart) if cart else None),
+                ).fetchone()
+            except psycopg.errors.UniqueViolation as e:
+                if e.diag.constraint_name != "payments_one_live_per_cart":
+                    raise
+                # Two keys raced on the same cart (each key's own lock doesn't cover the other).
+                raise WalletError("CART_ALREADY_PAID", "this cart has already been paid") from None
             hold = _hold_account(conn, key["user_id"])
             _post(conn, "hold", p["id"], [(key["wallet_id"], -amount_cents), (hold, amount_cents)])
             _log(conn, key_id, "pay", merchant_id, amount_cents, status)
@@ -367,6 +444,7 @@ def wallet_view(conn: psycopg.Connection, api_key: str) -> dict:
             "used_last_24h_cents": spent,
             "remaining_last_24h_cents": max(0, key["daily_cap_cents"] - spent),
             "confirm_above_cents": key["confirm_above_cents"],
+            "signed_carts_only": key["require_signed_cart"],
             "allowed_merchants": [dict(m) for m in _allowed_merchants(conn, key["id"])],
             "expires_at": key["expires_at"].isoformat() if key["expires_at"] else None,
         }
@@ -400,12 +478,14 @@ def create_user(conn: psycopg.Connection, name: str) -> dict:
         return {"user_id": u["id"], "wallet_id": w["id"], "name": name}
 
 
-def create_merchant(conn: psycopg.Connection, merchant_id: str, name: str) -> dict:
+def create_merchant(conn: psycopg.Connection, merchant_id: str, name: str, public_key: bytes | None = None) -> dict:
+    """public_key: the merchant's 32-byte Ed25519 key for signed carts (optional)."""
     with conn.transaction():
         a = conn.execute(
             "INSERT INTO accounts (kind, name) VALUES ('merchant', %s) RETURNING id", (f"merchant:{merchant_id}",)
         ).fetchone()
-        conn.execute("INSERT INTO merchants (id, name, account_id) VALUES (%s, %s, %s)", (merchant_id, name, a["id"]))
+        conn.execute("INSERT INTO merchants (id, name, account_id, public_key) VALUES (%s, %s, %s, %s)",
+                     (merchant_id, name, a["id"], public_key))
         return {"merchant_id": merchant_id, "account_id": a["id"]}
 
 
@@ -448,6 +528,7 @@ def issue_key(
     expires_in: timedelta | None = None,
     rate_limit_per_min: int = 60,
     confirm_repeat_minutes: int | None = None,
+    require_signed_cart: bool = False,
 ) -> IssuedKey:
     if scope not in ("read", "pay"):
         raise WalletError("BAD_REQUEST", "scope must be read or pay")
@@ -459,12 +540,12 @@ def issue_key(
         k = conn.execute(
             """INSERT INTO agent_keys (user_id, wallet_id, label, key_prefix, key_hash, scope,
                    per_payment_cap_cents, daily_cap_cents, confirm_above_cents, expires_at, rate_limit_per_min,
-                   confirm_repeat_minutes)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                   confirm_repeat_minutes, require_signed_cart)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (
                 user_id, w, label, secret[:10], hash_key(secret), scope, per_payment_cap_cents, daily_cap_cents,
                 confirm_above_cents, (datetime.now(timezone.utc) + expires_in) if expires_in else None,
-                rate_limit_per_min, confirm_repeat_minutes,
+                rate_limit_per_min, confirm_repeat_minutes, require_signed_cart,
             ),
         ).fetchone()
         for m in merchants:
